@@ -953,12 +953,13 @@ async function fbWrite(store, record) {
   await fbPatch(`events/${key}/${store}`, { [recKey]: record });
 }
 
-// Merge incoming Firebase records into local IndexedDB
-async function mergeRemote(store, remoteRecords) {
+// Merge incoming Firebase records into local IndexedDB, skipping tombstoned teams
+async function mergeRemote(store, remoteRecords, deletedTeams) {
   const local = await dbAll(store);
   const localKeys = new Set(local.map(r => r.timestamp + '_' + r.teamNum));
   let added = 0;
   for (const rec of remoteRecords) {
+    if (deletedTeams && deletedTeams.has(String(rec.teamNum))) continue;
     if (!localKeys.has(rec.timestamp + '_' + rec.teamNum)) {
       const { id, ...r } = rec;
       await dbAdd(store, r);
@@ -973,18 +974,20 @@ async function pushData() {
   const key = getSyncKey(); if (!key) return;
   setSyncDot('syncing');
   try {
+    const deletedSnap = await fbGet(`events/${key}/deleted`).catch(() => null);
+    const deletedTeams = new Set(deletedSnap ? Object.keys(deletedSnap) : []);
     const [matches, pits] = await Promise.all([dbAll('matches'), dbAll('pits')]);
     const mObj = {}, pObj = {};
-    for (const m of matches) { const k=`${m.timestamp}_${m.teamNum}`.replace(/[.#$[\]]/g,'_'); mObj[k]=m; }
-    for (const p of pits)    { const k=`${p.timestamp}_${p.teamNum}`.replace(/[.#$[\]]/g,'_'); pObj[k]=p; }
-    const updates = {};
-    if (Object.keys(mObj).length) updates[`events/${key}/matches`] = mObj;
-    if (Object.keys(pObj).length) updates[`events/${key}/pits`]    = pObj;
-    if (Object.keys(updates).length) {
-      // PATCH each store separately to avoid overwriting others' data
-      if (updates[`events/${key}/matches`]) await fbPatch(`events/${key}/matches`, mObj);
-      if (updates[`events/${key}/pits`])    await fbPatch(`events/${key}/pits`,    pObj);
+    for (const m of matches) {
+      if (deletedTeams.has(String(m.teamNum))) continue;
+      const k = `${m.timestamp}_${m.teamNum}`.replace(/[.#$[\]]/g,'_'); mObj[k]=m;
     }
+    for (const p of pits) {
+      if (deletedTeams.has(String(p.teamNum))) continue;
+      const k = `${p.timestamp}_${p.teamNum}`.replace(/[.#$[\]]/g,'_'); pObj[k]=p;
+    }
+    if (Object.keys(mObj).length) await fbPatch(`events/${key}/matches`, mObj);
+    if (Object.keys(pObj).length) await fbPatch(`events/${key}/pits`,    pObj);
     setSyncDot('ok'); lastSync = Date.now();
   } catch(e) { console.error('Push error:', e); setSyncDot('err'); }
 }
@@ -994,14 +997,28 @@ async function pullData() {
   const key = getSyncKey(); if (!key) return;
   setSyncDot('syncing');
   try {
-    const [remoteM, remoteP] = await Promise.all([
+    const [remoteM, remoteP, deletedSnap] = await Promise.all([
       fbGet(`events/${key}/matches`),
       fbGet(`events/${key}/pits`),
+      fbGet(`events/${key}/deleted`).catch(() => null),
     ]);
+    const deletedTeams = new Set(deletedSnap ? Object.keys(deletedSnap) : []);
+    // Purge any locally held records for deleted teams
+    if (deletedTeams.size > 0) {
+      const [lm, lp] = await Promise.all([dbAll('matches'), dbAll('pits')]);
+      await Promise.all([
+        ...lm.filter(m => deletedTeams.has(String(m.teamNum))).map(m => new Promise(r => {
+          const req = db.transaction('matches','readwrite').objectStore('matches').delete(m.id); req.onsuccess = r;
+        })),
+        ...lp.filter(p => deletedTeams.has(String(p.teamNum))).map(p => new Promise(r => {
+          const req = db.transaction('pits','readwrite').objectStore('pits').delete(p.id); req.onsuccess = r;
+        })),
+      ]);
+    }
     const remoteMatches = remoteM ? Object.values(remoteM) : [];
     const remotePits    = remoteP ? Object.values(remoteP) : [];
-    const mAdded = await mergeRemote('matches', remoteMatches);
-    const pAdded = await mergeRemote('pits',    remotePits);
+    const mAdded = await mergeRemote('matches', remoteMatches, deletedTeams);
+    const pAdded = await mergeRemote('pits',    remotePits,    deletedTeams);
     const total = mAdded + pAdded;
     setSyncDot('ok'); lastSync = Date.now();
     if (total > 0) { toast(`Synced: +${total} new records`); refreshDash(); renderTeams(); }
@@ -2066,7 +2083,7 @@ function setFilter(f,el){teamFilter=f;document.querySelectorAll('#team-pills .pi
 function filterTeams(v){teamSearch=v;renderTeams();}
 
 async function deleteTeam(tnum) {
-  if (!confirm(`Delete ALL match and pit data for team ${tnum}? This cannot be undone.`)) return;
+  if (!confirm(`Delete ALL match and pit data for team ${tnum}? This will remove the team from all devices and cannot be undone.`)) return;
 
   // Delete from local IndexedDB
   const [matches, pits] = await Promise.all([dbAll('matches'), dbAll('pits')]);
@@ -2078,11 +2095,15 @@ async function deleteTeam(tnum) {
     ...toDeleteP.map(p => new Promise(r => { const req = db.transaction('pits','readwrite').objectStore('pits').delete(p.id); req.onsuccess = r; })),
   ]);
 
-  // Delete from Firebase
+  // Write tombstone + delete records from Firebase
   const key = getSyncKey();
   if (key) {
     try {
-      // Set each record to null to delete it in Firebase REST API
+      // Write tombstone first — this tells ALL devices to purge this team
+      await fbPatch(`events/${key}/deleted`, {
+        [String(tnum)]: { deletedAt: Date.now(), deletedBy: DEVICE_ID }
+      });
+      // Also delete the actual records from Firebase
       const mDeletes = toDeleteM.map(m => {
         const k = `${m.timestamp}_${m.teamNum}`.replace(/[.#$[\]]/g, '_');
         return fbREST('DELETE', `events/${key}/matches/${k}`).catch(()=>{});
@@ -2095,7 +2116,7 @@ async function deleteTeam(tnum) {
     } catch(e) { console.error('Firebase delete error:', e); }
   }
 
-  toast(`Team ${tnum} deleted ✓`);
+  toast(`Team ${tnum} deleted from all devices ✓`);
   document.getElementById('td-ov').remove();
   renderTeams();
   refreshDash();
